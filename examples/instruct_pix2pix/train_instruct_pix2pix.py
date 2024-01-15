@@ -435,7 +435,8 @@ def main():
                 repo_id=args.hub_model_id or Path(args.output_dir).name, exist_ok=True, token=args.hub_token
             ).repo_id
 
-    # Load scheduler, tokenizer and models.
+    # Load scheduler, tokenizer and models. 
+    ### Text encoder: CLIP, Image -> latent: VAE, Denoiser: UNet 사용 
     noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
     tokenizer = CLIPTokenizer.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="tokenizer", revision=args.revision
@@ -615,7 +616,7 @@ def main():
 
     # Preprocessing the datasets.
     # We need to tokenize input captions and transform the images.
-    def tokenize_captions(captions):
+    def tokenize_captions(captions): # caption 전처리 (tokenize)
         inputs = tokenizer(
             captions, max_length=tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="pt"
         )
@@ -629,7 +630,7 @@ def main():
         ]
     )
 
-    def preprocess_images(examples):
+    def preprocess_images(examples): # image(original / edited) 전처리
         original_images = np.concatenate(
             [convert_to_np(image, args.resolution) for image in examples[original_image_column]]
         )
@@ -643,6 +644,7 @@ def main():
         images = 2 * (images / 255) - 1
         return train_transforms(images)
 
+    ### instructpix2pix의 train data: original image / editing caption / edited image 
     def preprocess_train(examples):
         # Preprocess images.
         preprocessed_images = preprocess_images(examples)
@@ -660,7 +662,7 @@ def main():
         # Preprocess the captions.
         captions = list(examples[edit_prompt_column])
         examples["input_ids"] = tokenize_captions(captions)
-        return examples
+        return examples # dictionary 형태로 묶어서 반환 
 
     with accelerator.main_process_first():
         if args.max_train_samples is not None:
@@ -704,7 +706,7 @@ def main():
     )
 
     # Prepare everything with our `accelerator`.
-    unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+    unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare( # accelerator에 모델들 적용 
         unet, optimizer, train_dataloader, lr_scheduler
     )
 
@@ -777,10 +779,10 @@ def main():
     progress_bar = tqdm(range(global_step, args.max_train_steps), disable=not accelerator.is_local_main_process)
     progress_bar.set_description("Steps")
 
-    for epoch in range(first_epoch, args.num_train_epochs):
+    for epoch in range(first_epoch, args.num_train_epochs): # Train loop - epoch 
         unet.train()
         train_loss = 0.0
-        for step, batch in enumerate(train_dataloader):
+        for step, batch in enumerate(train_dataloader): # Train loop - iteration 
             # Skip steps until we reach the resumed step
             if args.resume_from_checkpoint and epoch == first_epoch and step < resume_step:
                 if step % args.gradient_accumulation_steps == 0:
@@ -791,37 +793,37 @@ def main():
                 # We want to learn the denoising process w.r.t the edited images which
                 # are conditioned on the original image (which was edited) and the edit instruction.
                 # So, first, convert images to latent space.
-                latents = vae.encode(batch["edited_pixel_values"].to(weight_dtype)).latent_dist.sample()
+                latents = vae.encode(batch["edited_pixel_values"].to(weight_dtype)).latent_dist.sample() # VAE 이용해서 (Edited) Image to latent 
                 latents = latents * vae.config.scaling_factor
 
                 # Sample noise that we'll add to the latents
-                noise = torch.randn_like(latents)
+                noise = torch.randn_like(latents) # noise z 
                 bsz = latents.shape[0]
                 # Sample a random timestep for each image
-                timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
+                timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device) # timestep random sampling uniformly 
                 timesteps = timesteps.long()
 
                 # Add noise to the latents according to the noise magnitude at each timestep
                 # (this is the forward diffusion process)
-                noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+                noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps) # sampling한 timestep에 대해 noise injection 
 
                 # Get the text embedding for conditioning.
-                encoder_hidden_states = text_encoder(batch["input_ids"])[0]
+                encoder_hidden_states = text_encoder(batch["input_ids"])[0] # CLIP의 text encoder을 통해 hidden state로 embedding, 값 가져오기 
 
                 # Get the additional image embedding for conditioning.
                 # Instead of getting a diagonal Gaussian here, we simply take the mode.
-                original_image_embeds = vae.encode(batch["original_pixel_values"].to(weight_dtype)).latent_dist.mode()
+                original_image_embeds = vae.encode(batch["original_pixel_values"].to(weight_dtype)).latent_dist.mode() 
 
                 # Conditioning dropout to support classifier-free guidance during inference. For more details
                 # check out the section 3.2.1 of the original paper https://arxiv.org/abs/2211.09800.
                 if args.conditioning_dropout_prob is not None:
-                    random_p = torch.rand(bsz, device=latents.device, generator=generator)
+                    random_p = torch.rand(bsz, device=latents.device, generator=generator) # random하게 probablity sampling, bsz = batch size
                     # Sample masks for the edit prompts.
                     prompt_mask = random_p < 2 * args.conditioning_dropout_prob
                     prompt_mask = prompt_mask.reshape(bsz, 1, 1)
                     # Final text conditioning.
                     null_conditioning = text_encoder(tokenize_captions([""]).to(accelerator.device))[0]
-                    encoder_hidden_states = torch.where(prompt_mask, null_conditioning, encoder_hidden_states)
+                    encoder_hidden_states = torch.where(prompt_mask, null_conditioning, encoder_hidden_states) # random하게 null prompt
 
                     # Sample masks for the original images.
                     image_mask_dtype = original_image_embeds.dtype
@@ -831,13 +833,13 @@ def main():
                     )
                     image_mask = image_mask.reshape(bsz, 1, 1, 1)
                     # Final image conditioning.
-                    original_image_embeds = image_mask * original_image_embeds
+                    original_image_embeds = image_mask * original_image_embeds # edit할 부분만 masking
 
                 # Concatenate the `original_image_embeds` with the `noisy_latents`.
                 concatenated_noisy_latents = torch.cat([noisy_latents, original_image_embeds], dim=1)
 
                 # Get the target for loss depending on the prediction type
-                if noise_scheduler.config.prediction_type == "epsilon":
+                if noise_scheduler.config.prediction_type == "epsilon": # DDPM에서 사용하는 epsilon prediction 
                     target = noise
                 elif noise_scheduler.config.prediction_type == "v_prediction":
                     target = noise_scheduler.get_velocity(latents, noise, timesteps)
@@ -845,8 +847,8 @@ def main():
                     raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
 
                 # Predict the noise residual and compute loss
-                model_pred = unet(concatenated_noisy_latents, timesteps, encoder_hidden_states).sample
-                loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+                model_pred = unet(concatenated_noisy_latents, timesteps, encoder_hidden_states).sample # model이 예측한 epslion 
+                loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean") # epsilon prediction: target epslion과 mse 
 
                 # Gather the losses across all processes for logging (if we use distributed training).
                 avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
@@ -900,8 +902,9 @@ def main():
 
             if global_step >= args.max_train_steps:
                 break
-
-        if accelerator.is_main_process:
+        # validation step 
+        # original image와 editing caption을 받아서 edited image 생성 
+        if accelerator.is_main_process: 
             if (
                 (args.val_image_url is not None)
                 and (args.validation_prompt is not None)

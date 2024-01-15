@@ -921,7 +921,7 @@ def main(args):
     alpha_schedule = torch.sqrt(noise_scheduler.alphas_cumprod)
     sigma_schedule = torch.sqrt(1 - noise_scheduler.alphas_cumprod)
     # Initialize the DDIM ODE solver for distillation.
-    solver = DDIMSolver(
+    solver = DDIMSolver(  
         noise_scheduler.alphas_cumprod.numpy(),
         timesteps=noise_scheduler.config.num_train_timesteps,
         ddim_timesteps=args.num_ddim_timesteps,
@@ -973,10 +973,11 @@ def main(args):
         )
 
     # 8. Add LoRA to the student U-Net, only the LoRA projection matrix will be updated by the optimizer.
+    # lora: fine-tuning할 때 중요한 모듈 부분의 weight만 update하는 것 (Low rank apdatation)
     if args.lora_target_modules is not None:
         lora_target_modules = [module_key.strip() for module_key in args.lora_target_modules.split(",")]
     else:
-        lora_target_modules = [
+        lora_target_modules = [ # weight를 update하는 모듈들 
             "to_q",
             "to_k",
             "to_v",
